@@ -1,0 +1,2 @@
+[console_scripts]
+voicelive-gateway = voicelive_sip_gateway.gateway.main:run

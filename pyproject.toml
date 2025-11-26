@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voicelive-sip-gateway"
+version = "0.1.0"
+description = "Python rewrite of the Azure Voice Live SIP gateway sample"
+readme = "README.md"
+authors = [{ name = "Azure Samples" }]
+requires-python = ">=3.11"
+dependencies = [
+    "azure-ai-voicelive",
+    "pydantic>=2.8,<3",
+    "pydantic-settings>=2.4,<3",
+    "structlog>=24.1",
+    "numpy>=2.1",
+    "scipy>=1.14",
+    "soundfile>=0.12",
+    "pyaudio>=0.2.11",
+]
+
+# Note: pjsua Python bindings must be built/installed separately.
+# See: https://github.com/pjsip/pjproject/tree/master/pjsip-apps/src/python
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-mock>=3.12",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[project.scripts]
+voicelive-gateway = "voicelive_sip_gateway.gateway.main:run"
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+packages = ["voicelive_sip_gateway"]
