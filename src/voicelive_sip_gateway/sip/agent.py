@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import threading
 from typing import Optional
 import traceback
@@ -97,17 +98,18 @@ class CustomAudioMediaPort(pj.AudioMediaPort):
 class GatewayCall(pj.Call):
     """Handles SIP call lifecycle and connects media bridge."""
 
-    def __init__(self, account, call_id: int, logger: BoundLogger, bridge: AudioStreamBridge, 
-                 voicelive_client: VoiceLiveClient, loop: asyncio.AbstractEventLoop):
+    def __init__(self, account, call_id: int, logger: BoundLogger, settings: Settings,
+                 loop: asyncio.AbstractEventLoop):
         super().__init__(account, call_id)
         self._account = account
         self._logger = logger
-        self._bridge = bridge
-        self._voicelive_client = voicelive_client
+        self._settings = settings
         self._loop = loop
         self._to_voicelive_port = None
         self._from_voicelive_port = None
         self._event_task = None
+        self._bridge: Optional[AudioStreamBridge] = None
+        self._voicelive_client: Optional[VoiceLiveClient] = None
 
     def onCallState(self, prm: pj.OnCallStateParam) -> None:
         ci = self.getInfo()
@@ -118,8 +120,11 @@ class GatewayCall(pj.Call):
             code=ci.lastStatusCode,
         )
         if ci.state == pj.PJSIP_INV_STATE_DISCONNECTED:
-            self._cleanup()
-            self._account.current_call = None
+            # Clean up pjlib resources synchronously in pjsua thread
+            self._cleanup_media_ports()
+            # Clean up async resources (Voice Live, bridge) in asyncio thread
+            asyncio.run_coroutine_threadsafe(self._cleanup_async_resources(), self._loop)
+            self._account.remove_call(self)
 
     def onCallMediaState(self, prm: pj.OnCallMediaStateParam) -> None:
         ci = self.getInfo()
@@ -127,36 +132,55 @@ class GatewayCall(pj.Call):
             if mi.type == pj.PJMEDIA_TYPE_AUDIO and mi.status == pj.PJSUA_CALL_MEDIA_ACTIVE:
                 media = self.getMedia(mi.index)
                 aud_media = pj.AudioMedia.typecastFromMedia(media)
-                
+
+                # Create dedicated resources for this call
+                self._bridge = AudioStreamBridge(self._settings)
+                self._voicelive_client = VoiceLiveClient(self._settings)
+
                 # Create custom media ports to bridge pjsua ↔ Voice Live
+                # This MUST happen in the pjsua thread context
                 self._to_voicelive_port = CustomAudioMediaPort(self._bridge, "to_voicelive", self._logger)
                 self._from_voicelive_port = CustomAudioMediaPort(self._bridge, "from_voicelive", self._logger)
-                
+
                 self._to_voicelive_port.set_event_loop(self._loop)
                 self._from_voicelive_port.set_event_loop(self._loop)
-                
+
                 # Connect bidirectional audio flow
-                # Caller audio -> to_voicelive_port -> Voice Live
+                # These calls MUST happen from pjsua thread
                 aud_media.startTransmit(self._to_voicelive_port)
-                # Voice Live -> from_voicelive_port -> Caller audio
                 self._from_voicelive_port.startTransmit(aud_media)
-                
-                # Start processing Voice Live events
-                self._event_task = asyncio.run_coroutine_threadsafe(
-                    self._process_voicelive_events(),
-                    self._loop
-                )
-                
-                # Start the conversation with a greeting
+
+                # Initialize Voice Live connection asynchronously
                 asyncio.run_coroutine_threadsafe(
-                    self._voicelive_client.request_response(interrupt=False),
+                    self._initialize_voicelive(),
                     self._loop
                 )
-                
-                self._logger.info("sip.media_active", message="Voice Live bridge established")
+
+                self._logger.info("sip.media_active", message="Initializing Voice Live bridge")
                 break
         else:
             self._logger.info("sip.media_inactive")
+
+    async def _initialize_voicelive(self) -> None:
+        """Initialize Voice Live connection and start event processing."""
+        try:
+            # Connect to Voice Live
+            await self._voicelive_client.connect()
+
+            # Attach client to bridge
+            await self._bridge.attach_voicelive_client(self._voicelive_client)
+
+            # Start processing Voice Live events
+            self._event_task = asyncio.create_task(self._process_voicelive_events())
+
+            # Start the conversation with a greeting
+            await self._voicelive_client.request_response(interrupt=False)
+
+            self._logger.info("sip.voice_live_bridge_established")
+        except Exception as e:
+            self._logger.error("sip.initialization_failed", error=str(e))
+            # Clean up on failure
+            await self._cleanup_async_resources()
 
     async def _process_voicelive_events(self) -> None:
         """Process Voice Live events and route audio to SIP."""
@@ -199,66 +223,76 @@ class GatewayCall(pj.Call):
         except Exception as e:
             self._logger.error("voicelive.event_processing_error", error=str(e))
 
-    def _cleanup(self) -> None:
-        """Clean up media ports and tasks."""
-        if self._event_task:
-            self._event_task.cancel()
-            self._event_task = None
+    def _cleanup_media_ports(self) -> None:
+        """Clean up pjlib media ports synchronously (must be called from pjsua thread)."""
         if self._to_voicelive_port:
             self._to_voicelive_port = None
         if self._from_voicelive_port:
             self._from_voicelive_port = None
+        self._logger.debug("sip.media_ports_cleaned")
+
+    async def _cleanup_async_resources(self) -> None:
+        """Clean up async resources (Voice Live client and audio bridge)."""
+        if self._event_task:
+            self._event_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._event_task
+            self._event_task = None
+
+        # Close Voice Live connection
+        if self._voicelive_client:
+            await self._voicelive_client.close()
+            self._voicelive_client = None
+
+        # Close audio bridge
+        if self._bridge:
+            await self._bridge.close()
+            self._bridge = None
+
+        self._logger.info("sip.call_cleanup_complete")
 
 
 class GatewayAccount(pj.Account):
-    """Account that limits to one concurrent call."""
+    """Account that supports unlimited concurrent calls."""
 
-    def __init__(self, logger: BoundLogger, bridge: AudioStreamBridge, 
-                 voicelive_client: VoiceLiveClient, loop: asyncio.AbstractEventLoop):
+    def __init__(self, logger: BoundLogger, settings: Settings, loop: asyncio.AbstractEventLoop):
         super().__init__()
         self._logger = logger
-        self._bridge = bridge
-        self._voicelive_client = voicelive_client
+        self._settings = settings
         self._loop = loop
-        self.current_call: Optional[GatewayCall] = None
+        self.active_calls: dict[int, GatewayCall] = {}
 
     def onIncomingCall(self, prm: pj.OnIncomingCallParam) -> None:
-        if self.current_call:
-            call = GatewayCall(self, prm.callId, self._logger, self._bridge, 
-                              self._voicelive_client, self._loop)
-            ci = call.getInfo()
-            self._logger.warning("sip.busy", remote_uri=ci.remoteUri)
-            call.hangup(pj.CallOpParam())
-            return
+        self._logger.info("sip.incoming_call", active_calls=len(self.active_calls))
+        call = GatewayCall(self, prm.callId, self._logger, self._settings, self._loop)
 
-        self._logger.info("sip.incoming_call")
-        call = GatewayCall(self, prm.callId, self._logger, self._bridge, 
-                          self._voicelive_client, self._loop)
-        self.current_call = call
-        
+        # Track this call
+        call_info = call.getInfo()
+        self.active_calls[prm.callId] = call
+
         # Send 180 Ringing first
         ringing_param = pj.CallOpParam()
         ringing_param.statusCode = 180
         call.answer(ringing_param)
-        
+
         # Then accept the call with 200 OK
         accept_param = pj.CallOpParam()
         accept_param.statusCode = 200
         call.answer(accept_param)
 
+    def remove_call(self, call: GatewayCall) -> None:
+        """Remove a call from active calls tracking."""
+        call_info = call.getInfo()
+        if call_info.id in self.active_calls:
+            del self.active_calls[call_info.id]
+            self._logger.info("sip.call_removed", call_id=call_info.id, remaining_calls=len(self.active_calls))
+
 
 class SipAgent:
     """Coordinates pjsua signaling with RTP/Voice Live bridging."""
 
-    def __init__(
-        self,
-        settings: Settings,
-        bridge: AudioStreamBridge,
-        voicelive_client: VoiceLiveClient,
-    ) -> None:
+    def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._bridge = bridge
-        self._voicelive_client = voicelive_client
         self._logger: BoundLogger = structlog.get_logger(__name__)
         self._ep: Optional[pj.Endpoint] = None
         self._transport: Optional[pj.TransportConfig] = None
@@ -269,8 +303,6 @@ class SipAgent:
     async def start(self) -> None:
         if self._running:
             return
-
-        await self._bridge.attach_voicelive_client(self._voicelive_client)
 
         loop = asyncio.get_running_loop()
         self._thread = threading.Thread(target=self._run_pjsua_thread, args=(loop,), daemon=True)
@@ -297,7 +329,6 @@ class SipAgent:
                 self._ep = None
             except Exception as exc:
                 self._logger.warning("sip.stop_error", error=str(exc))
-        await self._bridge.close()
         self._logger.info("sip.agent_stopped")
 
     def _run_pjsua_thread(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -322,8 +353,7 @@ class SipAgent:
                 port=self._settings.sip.port,
             )
 
-            self._account = GatewayAccount(self._logger, self._bridge, 
-                                          self._voicelive_client, loop)
+            self._account = GatewayAccount(self._logger, self._settings, loop)
             
             if self._settings.sip.register_with_server and self._settings.sip.server:
                 acc_cfg = pj.AccountConfig()

@@ -3,10 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import wave
 from typing import Optional
 
-import pyaudio
 from structlog.stdlib import BoundLogger
 import structlog
 
@@ -27,17 +25,6 @@ class AudioStreamBridge:
         self._outbound_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._task: Optional[asyncio.Task[None]] = None
         self._voicelive_client = None
-        
-        # Initialize PyAudio for local playback
-        self._pyaudio = pyaudio.PyAudio()
-        self._speaker_stream = self._pyaudio.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=self.SIP_SAMPLE_RATE,
-            output=True,
-            frames_per_buffer=160  # 20ms frames at 8kHz
-        )
-        self._logger.info("bridge.speaker_enabled", sample_rate=self.SIP_SAMPLE_RATE)
 
     async def attach_voicelive_client(self, client) -> None:
         self._voicelive_client = client
@@ -103,6 +90,20 @@ class AudioStreamBridge:
                 break
         self._logger.info("bridge.outbound_queue_cleared")
 
+    def clear_all_queues(self) -> None:
+        """Clear all audio queues (for cleanup)."""
+        while not self._inbound_queue.empty():
+            try:
+                self._inbound_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        while not self._outbound_queue.empty():
+            try:
+                self._outbound_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._logger.info("bridge.all_queues_cleared")
+
     async def _flush(self) -> None:
         """Process inbound audio: PCM16 8kHz from SIP → PCM16 24kHz to Voice Live."""
         while True:
@@ -119,11 +120,8 @@ class AudioStreamBridge:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
-        
-        # Close speaker stream
-        if self._speaker_stream:
-            self._speaker_stream.stop_stream()
-            self._speaker_stream.close()
-        if self._pyaudio:
-            self._pyaudio.terminate()
-        self._logger.info("bridge.speaker_closed")
+
+        # Clear all queues
+        self.clear_all_queues()
+
+        self._logger.info("bridge.closed")

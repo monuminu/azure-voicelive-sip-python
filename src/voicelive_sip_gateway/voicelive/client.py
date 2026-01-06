@@ -81,6 +81,13 @@ class VoiceLiveClient:
                 await self._event_task
             self._event_task = None
 
+        # Clear the event queue to prevent memory leaks
+        while not self._event_queue.empty():
+            try:
+                self._event_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
         if self._connection_cm and self._connection:
             await self._connection_cm.__aexit__(None, None, None)
             self._connection = None
