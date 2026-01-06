@@ -177,6 +177,13 @@ class GatewayCall(pj.Call):
                             await self._bridge.emit_audio_to_sip(pcm_data)
                         except Exception as decode_err:
                             self._logger.warning("voicelive.audio_decode_failed", error=str(decode_err))
+                elif event.type == VoiceLiveEventType.INPUT_AUDIO_BUFFER_SPEECH_STARTED:
+                    # User started speaking - interrupt the bot
+                    self._logger.info("voicelive.user_speech_started", message="Interrupting bot response")
+                    # Clear any pending audio in the outbound queue
+                    self._bridge.clear_outbound_queue()
+                    # Send interrupt signal to Voice Live to stop generating audio
+                    #await self._voicelive_client.request_response(interrupt=True)
                 elif event.type == VoiceLiveEventType.ERROR:
                     error_msg = event.payload.get("error", str(event.payload))
                     self._logger.error("voicelive.event_error", error=error_msg)

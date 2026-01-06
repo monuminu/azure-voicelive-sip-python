@@ -109,4 +109,4 @@ class VoiceLiveClient:
     async def request_response(self, interrupt: bool = False) -> None:
         if not self._connection:
             raise RuntimeError("VoiceLive connection not established")
-        await self._connection.responses.create(interrupt=interrupt)
+        await self._connection.response.create()

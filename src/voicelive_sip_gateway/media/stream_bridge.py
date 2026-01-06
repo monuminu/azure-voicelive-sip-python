@@ -94,6 +94,15 @@ class AudioStreamBridge:
                 # except Exception as e:
                 #     self._logger.debug("bridge.speaker_error", error=str(e))
 
+    def clear_outbound_queue(self) -> None:
+        """Clear all pending audio from the outbound queue (for interruption)."""
+        while not self._outbound_queue.empty():
+            try:
+                self._outbound_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._logger.info("bridge.outbound_queue_cleared")
+
     async def _flush(self) -> None:
         """Process inbound audio: PCM16 8kHz from SIP → PCM16 24kHz to Voice Live."""
         while True:
