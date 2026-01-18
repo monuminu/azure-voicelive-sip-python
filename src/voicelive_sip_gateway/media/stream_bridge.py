@@ -64,7 +64,7 @@ class AudioStreamBridge:
         samples_per_frame = int(self.SIP_SAMPLE_RATE * frame_duration_ms / 1000)
         frame_size_bytes = samples_per_frame * 2  # PCM16 mono uses 2 bytes per sample
         total_frames = (len(pcm_8k) + frame_size_bytes - 1) // frame_size_bytes
-        self._logger.info(
+        self._logger.debug(
             "bridge.emit_chunk",
             voicelive_bytes=len(pcm_chunk),
             sip_bytes=len(pcm_8k),

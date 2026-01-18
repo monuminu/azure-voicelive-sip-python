@@ -1,9 +1,7 @@
-"""Azure Voice Live async client wrapper."""
+"""Azure Voice Live async client wrapper - simplified with direct event handling."""
 from __future__ import annotations
 
-import asyncio
-import contextlib
-from typing import AsyncIterator, Optional
+from typing import Optional
 
 from azure.ai.voicelive.aio import connect
 from azure.ai.voicelive.models import (
@@ -13,7 +11,10 @@ from azure.ai.voicelive.models import (
     OutputAudioFormat,
     RequestSession,
     ServerVad,
-    AudioInputTranscriptionOptions
+    AudioInputTranscriptionOptions,
+    ToolChoiceLiteral,
+    ServerEventConversationItemCreated,
+    ResponseFunctionCallItem,
 )
 from azure.core.credentials import AzureKeyCredential
 from azure.identity.aio import DefaultAzureCredential
@@ -21,11 +22,11 @@ from structlog.stdlib import BoundLogger
 import structlog
 
 from voicelive_sip_gateway.config.settings import Settings
-from voicelive_sip_gateway.voicelive.events import VoiceLiveEvent, map_sdk_event
+from voicelive_sip_gateway.voicelive.tools import ToolHandler
 
 
 class VoiceLiveClient:
-    """Manages lifecycle of an Azure Voice Live WebSocket connection."""
+    """Simplified Azure Voice Live client with direct SDK event handling."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -33,8 +34,7 @@ class VoiceLiveClient:
         self._connection = None
         self._aad_credential = None
         self._logger: BoundLogger = structlog.get_logger(__name__)
-        self._event_task: Optional[asyncio.Task[None]] = None
-        self._event_queue: asyncio.Queue[VoiceLiveEvent] = asyncio.Queue()
+        self._tool_handler = ToolHandler()
 
     async def __aenter__(self) -> "VoiceLiveClient":
         await self.connect()
@@ -44,6 +44,7 @@ class VoiceLiveClient:
         await self.close()
 
     async def connect(self) -> None:
+        """Connect to Azure Voice Live and configure session."""
         if self._connection:
             return
 
@@ -52,7 +53,7 @@ class VoiceLiveClient:
         else:
             self._aad_credential = DefaultAzureCredential()
             credential = await self._aad_credential.__aenter__()
-        
+
         self._connection_cm = connect(
             endpoint=self._settings.azure.endpoint,
             credential=credential,
@@ -60,34 +61,24 @@ class VoiceLiveClient:
         )
         self._connection = await self._connection_cm.__aenter__()
 
+        # Configure session with function tools
         session = RequestSession(
             model="gpt-4o",
             modalities=[Modality.TEXT, Modality.AUDIO],
             instructions=self._settings.azure.instructions,
             input_audio_format=InputAudioFormat.PCM16,
             output_audio_format=OutputAudioFormat.PCM16,
-            input_audio_transcription = AudioInputTranscriptionOptions(model= "azure-speech"),
+            input_audio_transcription=AudioInputTranscriptionOptions(model="azure-speech"),
             turn_detection=ServerVad(threshold=0.5, prefix_padding_ms=200, silence_duration_ms=400),
-            voice=AzureStandardVoice(name=self._settings.azure.voice)
+            voice=AzureStandardVoice(name=self._settings.azure.voice),
+            tools=self._tool_handler.get_tools(),
+            tool_choice=ToolChoiceLiteral.AUTO,
         )
         await self._connection.session.update(session=session)
-        self._event_task = asyncio.create_task(self._drain_events())
         self._logger.info("voicelive.connected", endpoint=self._settings.azure.endpoint)
 
     async def close(self) -> None:
-        if self._event_task:
-            self._event_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._event_task
-            self._event_task = None
-
-        # Clear the event queue to prevent memory leaks
-        while not self._event_queue.empty():
-            try:
-                self._event_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-
+        """Close the Voice Live connection."""
         if self._connection_cm and self._connection:
             await self._connection_cm.__aexit__(None, None, None)
             self._connection = None
@@ -98,22 +89,24 @@ class VoiceLiveClient:
             await self._aad_credential.__aexit__(None, None, None)
             self._aad_credential = None
 
-    async def _drain_events(self) -> None:
-        assert self._connection is not None
-        async for event in self._connection:
-            await self._event_queue.put(map_sdk_event(event))
-
-    async def events(self) -> AsyncIterator[VoiceLiveEvent]:
-        while True:
-            event = await self._event_queue.get()
-            yield event
-
     async def send_audio_chunk(self, pcm_bytes: bytes) -> None:
+        """Send audio data to Voice Live."""
         if not self._connection:
             raise RuntimeError("VoiceLive connection not established")
         await self._connection.input_audio_buffer.append(audio=pcm_bytes)
 
-    async def request_response(self, interrupt: bool = False) -> None:
+    async def request_response(self, additional_instructions) -> None:
+        """Request a response from the AI."""
         if not self._connection:
             raise RuntimeError("VoiceLive connection not established")
-        await self._connection.response.create()
+        await self._connection.response.create(additional_instructions = additional_instructions)
+
+    @property
+    def tool_handler(self) -> ToolHandler:
+        """Get the tool handler for function calling."""
+        return self._tool_handler
+
+    @property
+    def connection(self):
+        """Get the underlying SDK connection."""
+        return self._connection
