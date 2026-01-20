@@ -1,0 +1,14 @@
+# Core dependencies for Azure Voice Live SIP Gateway
+azure-ai-voicelive
+azure-core
+azure-identity
+aiohttp
+pydantic>=2.8,<3
+pydantic-settings>=2.4,<3
+structlog>=24.1
+numpy>=2.1
+scipy>=1.14
+soundfile>=0.12
+
+# Note: pjsua2 Python bindings are built during Docker image build
+# They are not available via pip and must be compiled from source

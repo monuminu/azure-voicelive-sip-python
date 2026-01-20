@@ -74,7 +74,12 @@ class CustomAudioMediaPort(pj.AudioMediaPort):
                 frame.type = pj.PJMEDIA_FRAME_TYPE_AUDIO
                 frame.buf = pj.ByteVector(pcm_data)
                 frame.size = len(pcm_data)
-            except Exception:
+                
+                # Debug: log non-silent frames
+                if pcm_data != b'\x00' * 320:
+                    self._logger.debug("media.frame_to_sip", bytes=len(pcm_data))
+            except Exception as e:
+                self._logger.warning("media.frame_request_error", error=str(e))
                 frame.type = pj.PJMEDIA_FRAME_TYPE_AUDIO
                 frame.buf = pj.ByteVector(b'\x00' * 320)
                 frame.size = 320
@@ -84,8 +89,10 @@ class CustomAudioMediaPort(pj.AudioMediaPort):
         if self._direction == "to_voicelive" and self._loop:
             if frame.type == pj.PJMEDIA_FRAME_TYPE_AUDIO and frame.buf:
                 try:
+                    frame_bytes = bytes(frame.buf)
+                    self._logger.debug("media.frame_from_sip", bytes=len(frame_bytes))
                     asyncio.run_coroutine_threadsafe(
-                        self._bridge.enqueue_sip_audio(bytes(frame.buf)),
+                        self._bridge.enqueue_sip_audio(frame_bytes),
                         self._loop
                     )
                 except Exception as e:
@@ -137,8 +144,18 @@ class GatewayCall(pj.Call):
                 self._to_voicelive_port.set_event_loop(self._loop)
                 self._from_voicelive_port.set_event_loop(self._loop)
 
-                aud_media.startTransmit(self._to_voicelive_port)
-                self._from_voicelive_port.startTransmit(aud_media)
+                # Connect the call audio to our custom ports
+                # aud_media -> to_voicelive_port: caller's audio goes to Voice Live
+                # from_voicelive_port -> aud_media: Voice Live audio goes to caller
+                try:
+                    aud_media.startTransmit(self._to_voicelive_port)
+                    self._from_voicelive_port.startTransmit(aud_media)
+                    self._logger.info("sip.media_connected", 
+                                      to_voicelive_port_id=self._to_voicelive_port.getPortId(),
+                                      from_voicelive_port_id=self._from_voicelive_port.getPortId())
+                except Exception as e:
+                    self._logger.error("sip.media_connect_failed", error=str(e))
+                    return
 
                 asyncio.run_coroutine_threadsafe(
                     self._initialize_voicelive(),
@@ -349,16 +366,41 @@ class SipAgent:
             self._ep.libCreate()
 
             ep_cfg = pj.EpConfig()
-            ep_cfg.logConfig.level = 2
-            ep_cfg.logConfig.consoleLevel = 2
+            ep_cfg.logConfig.level = 4  # Increase log level for debugging
+            ep_cfg.logConfig.consoleLevel = 4
+            
+            # Configure RTP/media port range for NAT traversal
+            ep_cfg.medConfig.rxDropPct = 0
+            ep_cfg.medConfig.txDropPct = 0
+            ep_cfg.medConfig.noVad = True
+            
+            # Configure STUN for NAT traversal (only if ICE is enabled)
+            if self._settings.sip.enable_ice:
+                stun_srv = f"{self._settings.sip.stun_server}:{self._settings.sip.stun_port}"
+                ep_cfg.uaConfig.stunServer.append(stun_srv)
+                self._logger.info("sip.stun_configuration", stun_server=stun_srv)
+            
             self._ep.libInit(ep_cfg)
-
+            
+            # Enable null audio device for headless/Docker environments
+            # This MUST be called immediately after libInit() before any media operations
+            # The null device provides a software clock for the conference bridge
+            self._ep.audDevManager().setNullDev()
+            self._logger.info("sip.null_audio_device_enabled")
+            
             transport_cfg = pj.TransportConfig()
             transport_cfg.port = self._settings.sip.port
+            # Bind to all interfaces for Docker networking
+            transport_cfg.boundAddress = self._settings.sip.local_address
+            
+            # Configure public address if behind NAT (for Docker host networking)
+            if self._settings.sip.via_address and self._settings.sip.via_address != "0.0.0.0":
+                transport_cfg.publicAddress = self._settings.sip.via_address
+            
             self._ep.transportCreate(pj.PJSIP_TRANSPORT_UDP, transport_cfg)
-
             self._ep.libStart()
-            self._logger.info("sip.transport_created", port=self._settings.sip.port)
+            self._logger.info("sip.transport_created", port=self._settings.sip.port,
+                            public_address=transport_cfg.publicAddress if transport_cfg.publicAddress else "none")
 
             self._account = GatewayAccount(self._logger, self._settings, loop)
 
@@ -366,7 +408,25 @@ class SipAgent:
                 acc_cfg = pj.AccountConfig()
                 acc_cfg.idUri = f"sip:{self._settings.sip.user}@{self._settings.sip.server}"
                 acc_cfg.regConfig.registrarUri = f"sip:{self._settings.sip.server}"
-
+                
+                # Configure media transport for NAT traversal
+                acc_cfg.mediaConfig.transportConfig.port = self._settings.sip.media_port
+                acc_cfg.mediaConfig.transportConfig.portRange = self._settings.sip.port_count
+                
+                # Set public/bound address for media if specified (important for Docker/NAT)
+                if self._settings.sip.media_address and self._settings.sip.media_address != "0.0.0.0":
+                    acc_cfg.mediaConfig.transportConfig.publicAddress = self._settings.sip.media_address
+                elif self._settings.sip.via_address and self._settings.sip.via_address != "0.0.0.0":
+                    acc_cfg.mediaConfig.transportConfig.publicAddress = self._settings.sip.via_address
+                
+                # Enable ICE for NAT traversal if configured
+                if self._settings.sip.enable_ice:
+                    acc_cfg.natConfig.iceEnabled = True
+                    acc_cfg.natConfig.turnEnabled = False
+                    acc_cfg.natConfig.sipStunUse = pj.PJSUA_STUN_USE_DEFAULT
+                    acc_cfg.natConfig.mediaStunUse = pj.PJSUA_STUN_USE_DEFAULT
+                    self._logger.info("sip.ice_and_stun_enabled")
+                
                 cred = pj.AuthCredInfo()
                 cred.scheme = "digest"
                 cred.realm = self._settings.sip.auth_realm or "*"
@@ -379,10 +439,39 @@ class SipAgent:
             else:
                 acc_cfg = pj.AccountConfig()
                 acc_cfg.idUri = f"sip:{self._settings.sip.user or 'gateway'}@{self._settings.sip.local_address}:{self._settings.sip.port}"
+                
+                # Configure media transport for NAT traversal (even without registration)
+                acc_cfg.mediaConfig.transportConfig.port = self._settings.sip.media_port
+                acc_cfg.mediaConfig.transportConfig.portRange = self._settings.sip.port_count
+                
+                # Set public/bound address for media if specified (important for Docker/NAT)
+                if self._settings.sip.media_address and self._settings.sip.media_address != "0.0.0.0":
+                    acc_cfg.mediaConfig.transportConfig.publicAddress = self._settings.sip.media_address
+                    self._logger.info("sip.media_public_address_set", address=self._settings.sip.media_address)
+                elif self._settings.sip.via_address and self._settings.sip.via_address != "0.0.0.0":
+                    acc_cfg.mediaConfig.transportConfig.publicAddress = self._settings.sip.via_address
+                    self._logger.info("sip.media_public_address_set", address=self._settings.sip.via_address)
+                
+                # Enable ICE for NAT traversal if configured
+                if self._settings.sip.enable_ice:
+                    acc_cfg.natConfig.iceEnabled = True
+                    acc_cfg.natConfig.turnEnabled = False
+                    # Enable STUN for public address discovery
+                    acc_cfg.natConfig.sipStunUse = pj.PJSUA_STUN_USE_DEFAULT
+                    acc_cfg.natConfig.mediaStunUse = pj.PJSUA_STUN_USE_DEFAULT
+                    self._logger.info("sip.ice_and_stun_enabled")
+                
                 self._account.create(acc_cfg)
+            
+            self._logger.info(
+                "sip.media_config",
+                media_port=self._settings.sip.media_port,
+                port_range=self._settings.sip.port_count
+            )
 
             while self._running:
                 self._ep.libHandleEvents(100)
 
         except Exception as exc:
-            self._logger.error("sip.thread_error", error=str(exc), type=type(exc).__name__)
+            import traceback
+            self._logger.error("sip.thread_error", error=str(exc), type=type(exc).__name__, traceback=traceback.format_exc())

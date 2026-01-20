@@ -32,9 +32,9 @@ class AzureVoiceLiveSettings(BaseSettings):
 class SipSettings(BaseSettings):
     """mjSIP-compatible configuration values."""
 
-    local_address: str = Field("127.0.0.1", alias="SIP_LOCAL_ADDRESS")
-    via_address: str = Field("127.0.0.1", alias="SIP_VIA_ADDR")
-    media_address: str = Field("127.0.0.1", alias="MEDIA_ADDRESS")
+    local_address: str = Field("0.0.0.0", alias="SIP_LOCAL_ADDRESS")
+    via_address: str = Field("0.0.0.0", alias="SIP_VIA_ADDR")
+    media_address: str = Field("0.0.0.0", alias="MEDIA_ADDRESS")
     register_with_server: bool = Field(False, alias="REGISTER_WITH_SIP_SERVER")
     server: Optional[str] = Field(None, alias="SIP_SERVER")
     port: int = Field(5060, alias="SIP_PORT")
@@ -45,6 +45,10 @@ class SipSettings(BaseSettings):
     display_name: str = Field("Voice Live Gateway", alias="DISPLAY_NAME")
     media_port: int = Field(10000, alias="MEDIA_PORT")
     port_count: int = Field(1000, alias="MEDIA_PORT_COUNT")
+    # ICE/STUN configuration for NAT traversal and dual-stack (IPv4/IPv6) support
+    enable_ice: bool = Field(True, alias="SIP_ENABLE_ICE")
+    stun_server: str = Field("stun.l.google.com", alias="SIP_STUN_SERVER")
+    stun_port: int = Field(19302, alias="SIP_STUN_PORT")
 
 
 class LoggingSettings(BaseSettings):

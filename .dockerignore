@@ -1,0 +1,4 @@
+# Add Docker-related files to .gitignore
+.env
+logs/
+*.log

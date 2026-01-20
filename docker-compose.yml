@@ -1,0 +1,15 @@
+# Docker Compose for Azure Voice Live SIP Gateway
+
+services:
+  voicelive-sip-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - 0.0.0.0:5060:5060/udp
+      - 0.0.0.0:5060:5060/tcp
+      - 0.0.0.0:10000-11000:10000-11000/udp  # RTP media ports
+    env_file:
+      - .env
+    container_name: voicelive-sip-gateway
+    restart: unless-stopped

@@ -17,7 +17,6 @@ dependencies = [
     "numpy>=2.1",
     "scipy>=1.14",
     "soundfile>=0.12",
-    "pyaudio>=0.2.11",
 ]
 
 # Note: pjsua Python bindings must be built/installed separately.
