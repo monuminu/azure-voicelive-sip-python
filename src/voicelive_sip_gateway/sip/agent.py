@@ -40,6 +40,14 @@ class CustomAudioMediaPort(pj.AudioMediaPort):
         self._direction = direction
         self._logger = logger
         self._loop = None
+        # Logging counters
+        self._frame_request_count = 0
+        self._frame_receive_count = 0
+        self._silence_count = 0
+        self._audio_count = 0
+        self._last_log_time = 0
+        self._slow_frame_count = 0
+        self._error_count = 0
 
         fmt = pj.MediaFormatAudio()
         fmt.type = pj.PJMEDIA_TYPE_AUDIO
@@ -55,15 +63,24 @@ class CustomAudioMediaPort(pj.AudioMediaPort):
         self._loop = loop
 
     def onFrameRequested(self, frame: pj.MediaFrame) -> None:
-        """Called by pjsua when it needs audio to send to caller (from Voice Live)."""
-        if self._direction == "from_voicelive" and self._loop:
+        """Called by pjsua when it needs audio to send to caller (from Voice Live).
+        
+        Uses synchronous dequeue_sip_audio_sync() which reads directly from a
+        thread-safe queue, eliminating asyncio cross-thread overhead that was
+        causing audio dropouts.
+        """
+        import time
+        self._frame_request_count += 1
+        start_time = time.time()
+        
+        if self._direction == "from_voicelive":
             try:
-                future = asyncio.run_coroutine_threadsafe(
-                    self._bridge.dequeue_sip_audio_nonblocking(),
-                    self._loop
-                )
-                pcm_data = future.result(timeout=0.050)
-
+                # Direct synchronous call - NO asyncio overhead!
+                # The bridge uses a thread-safe queue.Queue for outbound audio
+                pcm_data = self._bridge.dequeue_sip_audio_sync()
+                
+                elapsed_ms = (time.time() - start_time) * 1000
+                
                 expected_bytes = 320
                 if len(pcm_data) != expected_bytes:
                     if len(pcm_data) < expected_bytes:
@@ -75,28 +92,77 @@ class CustomAudioMediaPort(pj.AudioMediaPort):
                 frame.buf = pj.ByteVector(pcm_data)
                 frame.size = len(pcm_data)
                 
-                # Debug: log non-silent frames
-                if pcm_data != b'\x00' * 320:
-                    self._logger.debug("media.frame_to_sip", bytes=len(pcm_data))
+                # Track if this is silence or real audio
+                is_silence = pcm_data == b'\x00' * 320
+                if is_silence:
+                    self._silence_count += 1
+                else:
+                    self._audio_count += 1
+                
+                # Track slow frames (>5ms is concerning for 20ms frame interval)
+                if elapsed_ms > 5.0:
+                    self._slow_frame_count += 1
+                
+                # Log every second
+                now = time.time()
+                if now - self._last_log_time >= 1.0:
+                    self._logger.info(
+                        "media.frame_request_stats",
+                        direction=self._direction,
+                        total_requests=self._frame_request_count,
+                        audio_frames=self._audio_count,
+                        silence_frames=self._silence_count,
+                        slow_frames=self._slow_frame_count,
+                        errors=self._error_count,
+                        last_elapsed_ms=round(elapsed_ms, 2),
+                    )
+                    self._last_log_time = now
+                
             except Exception as e:
-                self._logger.warning("media.frame_request_error", error=str(e))
+                self._error_count += 1
+                self._logger.warning(
+                    "media.frame_request_error",
+                    error=str(e),
+                    request_num=self._frame_request_count,
+                    error_count=self._error_count,
+                )
                 frame.type = pj.PJMEDIA_FRAME_TYPE_AUDIO
                 frame.buf = pj.ByteVector(b'\x00' * 320)
                 frame.size = 320
 
     def onFrameReceived(self, frame: pj.MediaFrame) -> None:
         """Called by pjsua when it receives audio from caller (to Voice Live)."""
+        import time
+        self._frame_receive_count += 1
+        
         if self._direction == "to_voicelive" and self._loop:
             if frame.type == pj.PJMEDIA_FRAME_TYPE_AUDIO and frame.buf:
                 try:
                     frame_bytes = bytes(frame.buf)
-                    self._logger.debug("media.frame_from_sip", bytes=len(frame_bytes))
+                    
+                    # Log every second
+                    now = time.time()
+                    if now - self._last_log_time >= 1.0:
+                        self._logger.info(
+                            "media.frame_receive_stats",
+                            direction=self._direction,
+                            total_received=self._frame_receive_count,
+                            frame_bytes=len(frame_bytes),
+                        )
+                        self._last_log_time = now
+                    
                     asyncio.run_coroutine_threadsafe(
                         self._bridge.enqueue_sip_audio(frame_bytes),
                         self._loop
                     )
                 except Exception as e:
-                    self._logger.warning("media.enqueue_failed", error=str(e))
+                    self._error_count += 1
+                    self._logger.warning(
+                        "media.enqueue_failed",
+                        error=str(e),
+                        receive_num=self._frame_receive_count,
+                        error_count=self._error_count,
+                    )
 
 
 class GatewayCall(pj.Call):
@@ -181,12 +247,26 @@ class GatewayCall(pj.Call):
 
     async def _process_voicelive_events(self) -> None:
         """Process Voice Live SDK events directly - simplified pattern from Azure sample."""
+        import time
         try:
             connection = self._voicelive_client.connection
             pending_function_call = None  # Track active function call
             waiting_for_response_done = False  # Track if we need to wait for RESPONSE_DONE
+            
+            # Logging counters
+            event_count = 0
+            audio_delta_count = 0
+            total_audio_bytes = 0
+            response_count = 0
+            last_audio_time = None
+            last_log_time = time.time()
+            audio_gap_warnings = 0
+            
+            self._logger.info("voicelive.event_loop_started")
 
             async for event in connection:
+                event_count += 1
+                event_time = time.time()
                 # Handle function calling
                 if isinstance(event, ServerEventConversationItemCreated):
                     if isinstance(event.item, ResponseFunctionCallItem):
@@ -227,7 +307,22 @@ class GatewayCall(pj.Call):
 
                 # Handle audio events
                 if event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
+                    audio_delta_count += 1
                     audio_bytes = event.delta
+                    
+                    # Detect gaps between audio chunks
+                    if last_audio_time is not None:
+                        gap_ms = (event_time - last_audio_time) * 1000
+                        if gap_ms > 100:  # More than 100ms gap is concerning
+                            audio_gap_warnings += 1
+                            self._logger.warning(
+                                "voicelive.audio_gap_detected",
+                                gap_ms=round(gap_ms, 2),
+                                delta_num=audio_delta_count,
+                                total_gaps=audio_gap_warnings,
+                            )
+                    last_audio_time = event_time
+                    
                     if audio_bytes:
                         try:
                             # Check if audio_bytes is base64 string or already bytes
@@ -235,9 +330,52 @@ class GatewayCall(pj.Call):
                                 pcm_data = base64.b64decode(audio_bytes)
                             else:
                                 pcm_data = audio_bytes
+                            
+                            total_audio_bytes += len(pcm_data)
+                            
+                            # Log audio stats every second
+                            now = time.time()
+                            if now - last_log_time >= 1.0:
+                                self._logger.info(
+                                    "voicelive.audio_stream_stats",
+                                    total_events=event_count,
+                                    audio_deltas=audio_delta_count,
+                                    total_audio_bytes=total_audio_bytes,
+                                    responses=response_count,
+                                    gap_warnings=audio_gap_warnings,
+                                    last_chunk_bytes=len(pcm_data),
+                                )
+                                last_log_time = now
+                            
                             await self._bridge.emit_audio_to_sip(pcm_data)
                         except Exception as e:
-                            self._logger.warning("sip.audio_decode_failed", error=str(e))
+                            self._logger.warning(
+                                "sip.audio_decode_failed",
+                                error=str(e),
+                                delta_num=audio_delta_count,
+                            )
+                    else:
+                        self._logger.debug(
+                            "voicelive.empty_audio_delta",
+                            delta_num=audio_delta_count,
+                        )
+
+                elif event.type == ServerEventType.RESPONSE_CREATED:
+                    response_count += 1
+                    self._logger.info(
+                        "voicelive.response_started",
+                        response_num=response_count,
+                        total_events=event_count,
+                    )
+
+                elif event.type == ServerEventType.RESPONSE_DONE:
+                    if not waiting_for_response_done:
+                        self._logger.info(
+                            "voicelive.response_complete",
+                            response_num=response_count,
+                            audio_deltas_so_far=audio_delta_count,
+                            total_audio_bytes=total_audio_bytes,
+                        )
 
                 elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STARTED:
                     self._logger.info("sip.user_speech_started")
@@ -397,7 +535,10 @@ class SipAgent:
             if self._settings.sip.via_address and self._settings.sip.via_address != "0.0.0.0":
                 transport_cfg.publicAddress = self._settings.sip.via_address
             
+            # Create both UDP and TCP transports for better Docker compatibility
+            # TCP is preferred for Docker as it maintains connection state for proper response routing
             self._ep.transportCreate(pj.PJSIP_TRANSPORT_UDP, transport_cfg)
+            self._ep.transportCreate(pj.PJSIP_TRANSPORT_TCP, transport_cfg)
             self._ep.libStart()
             self._logger.info("sip.transport_created", port=self._settings.sip.port,
                             public_address=transport_cfg.publicAddress if transport_cfg.publicAddress else "none")

@@ -99,3 +99,26 @@ src/voicelive_sip_gateway/
 - Local testing: run gateway on `127.0.0.1` and connect a SIP softphone directly.
 - Production: deploy behind an SBC + SIP server, expose RTP/SIP ports, and set the SIP_* env vars (examples in `docs/deployment-scenarios.md`).
 - Containerization: add Docker support by installing dependencies into an image, copying `.env` or secrets via Kubernetes/ACI, and running `python -m voicelive_sip_gateway.gateway.main`.
+
+## Docker Quick Start
+
+Build and run the gateway in Docker with a single command:
+
+```powershell
+docker stop voicelive-gateway 2>$null; docker rm voicelive-gateway 2>$null; docker build -t voicelive-gateway . ; docker run -d --name voicelive-gateway --env-file .env -p 5080:5080/udp -p 5080:5080/tcp -p 10000-10100:10000-10100/udp voicelive-gateway
+```
+
+This command:
+1. Stops and removes any existing `voicelive-gateway` container
+2. Builds a fresh image from the `Dockerfile`
+3. Runs the container in detached mode with environment variables from `.env`
+4. Exposes SIP on port 5080 (UDP + TCP) and RTP on ports 10000-10100 (UDP)
+
+### Testing with MicroSIP
+
+1. Download and install [MicroSIP](https://www.microsip.org/) (free open-source SIP softphone for Windows)
+2. Configure MicroSIP to use **TCP transport** (Settings → Network → Transport: TCP)
+3. Make a call to: `sip:test@127.0.0.1:5080`
+4. You should hear the AI assistant greeting and can begin a conversation
+
+> **Tip:** Use `docker logs -f voicelive-gateway` to monitor gateway logs in real-time during testing.
