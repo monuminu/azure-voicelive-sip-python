@@ -58,6 +58,15 @@ class LoggingSettings(BaseSettings):
     log_file: Optional[str] = Field("logs/gateway.log", alias="VOICE_LIVE_LOG_FILE")
 
 
+class RecordingSettings(BaseSettings):
+    """Call recording configuration."""
+
+    enabled: bool = Field(False, alias="RECORDING_ENABLED")
+    directory: str = Field("recordings", alias="RECORDING_DIR")
+    max_duration_sec: int = Field(1800, alias="RECORDING_MAX_DURATION_SEC")
+    min_disk_mb: int = Field(500, alias="RECORDING_MIN_DISK_MB")
+
+
 class Settings(BaseSettings):
     """Top-level settings object composed of domain-specific sections."""
 
@@ -66,6 +75,7 @@ class Settings(BaseSettings):
     azure: AzureVoiceLiveSettings = AzureVoiceLiveSettings()
     sip: SipSettings = SipSettings()
     logging: LoggingSettings = LoggingSettings()
+    recording: RecordingSettings = RecordingSettings()
 
 
 @lru_cache(maxsize=1)

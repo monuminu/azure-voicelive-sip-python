@@ -40,6 +40,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install the package
 RUN pip install --no-cache-dir -e .
 
+# Create recordings directory
+RUN mkdir -p /app/recordings
+
 # Expose SIP port (UDP)
 EXPOSE 5060/udp
 EXPOSE 5060/tcp

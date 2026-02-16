@@ -28,6 +28,7 @@ except ImportError:
 
 from voicelive_sip_gateway.config.settings import Settings
 from voicelive_sip_gateway.media.stream_bridge import AudioStreamBridge
+from voicelive_sip_gateway.recording.recorder import CallRecorder
 from voicelive_sip_gateway.voicelive.client import VoiceLiveClient
 
 
@@ -180,6 +181,7 @@ class GatewayCall(pj.Call):
         self._event_task = None
         self._bridge: Optional[AudioStreamBridge] = None
         self._voicelive_client: Optional[VoiceLiveClient] = None
+        self._recorder: Optional[CallRecorder] = None
 
     def onCallState(self, prm: pj.OnCallStateParam) -> None:
         ci = self.getInfo()
@@ -201,7 +203,18 @@ class GatewayCall(pj.Call):
                 media = self.getMedia(mi.index)
                 aud_media = pj.AudioMedia.typecastFromMedia(media)
 
-                self._bridge = AudioStreamBridge(self._settings)
+                # ── optional per-call recorder ──────────────────────────
+                recorder: Optional[CallRecorder] = None
+                if self._settings.recording.enabled:
+                    caller_uri = ci.remoteUri  # e.g. "sip:+15551234567@..."
+                    # Extract user part (number) from SIP URI
+                    caller_number = caller_uri
+                    if "sip:" in caller_number:
+                        caller_number = caller_number.split("sip:")[1].split("@")[0]
+                    recorder = CallRecorder(caller_number, self._settings.recording)
+                    self._recorder = recorder
+
+                self._bridge = AudioStreamBridge(self._settings, recorder=recorder)
                 self._voicelive_client = VoiceLiveClient(self._settings)
 
                 self._to_voicelive_port = CustomAudioMediaPort(self._bridge, "to_voicelive", self._logger)
@@ -418,6 +431,17 @@ class GatewayCall(pj.Call):
         if self._bridge:
             await self._bridge.close()
             self._bridge = None
+
+        # Finalize recording after all audio streams have stopped
+        if self._recorder:
+            try:
+                loop = asyncio.get_running_loop()
+                path = await loop.run_in_executor(None, self._recorder.finalize)
+                if path:
+                    self._logger.info("sip.recording_saved", path=path)
+            except Exception as exc:
+                self._logger.error("sip.recording_failed", error=str(exc))
+            self._recorder = None
 
         self._logger.info("sip.call_cleanup_complete")
 

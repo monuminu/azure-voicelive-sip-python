@@ -8,6 +8,7 @@ This project bridges traditional SIP/RTP audio with the Azure AI Voice Live real
 - Transcodes between μ-law and PCM16 + resamples audio to 24 kHz for Voice Live.
 - Supports proactive greetings, configurable models/voices, and both API key or AAD authentication.
 - Flexible deployment: direct SIP for local testing or SIP server + SBC for production (see `docs/deployment-scenarios.md`).
+- Optional per-call conversation recording with configurable output directory, duration cap, and disk-space safety checks.
 
 ## Requirements
 - Python 3.11+
@@ -64,6 +65,10 @@ This project bridges traditional SIP/RTP audio with the Azure AI Voice Live real
 | `SIP_LOCAL_ADDRESS`, `SIP_VIA_ADDR`, `MEDIA_ADDRESS` | Network binding information |
 | `MEDIA_PORT`, `MEDIA_PORT_COUNT` | Starting RTP port and number of sequential ports reserved for the RTP bridge |
 | `REGISTER_WITH_SIP_SERVER` | `true/false`, registrar support planned (currently ignored) |
+| `RECORDING_ENABLED` | `true/false` — enable per-call WAV recording (default: `false`) |
+| `RECORDING_DIR` | Directory for WAV files (default: `recordings`) |
+| `RECORDING_MAX_DURATION_SEC` | Maximum recording length in seconds (default: `1800` / 30 min) |
+| `RECORDING_MIN_DISK_MB` | Minimum free disk space (MB) required before writing a recording (default: `500`) |
 
 For AAD flows set `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET` or rely on managed identity.
 
@@ -81,6 +86,7 @@ src/voicelive_sip_gateway/
   gateway/       # Runtime entry point + lifecycle code
   logging/       # Structlog configuration helpers
   media/         # Audio bridging + μ-law transcoding utilities
+  recording/     # Per-call WAV conversation recorder
   sip/           # SIP agent (pjsua-based)
   voicelive/     # Azure Voice Live SDK wrapper + event modeling
 ```
@@ -122,3 +128,90 @@ This command:
 4. You should hear the AI assistant greeting and can begin a conversation
 
 > **Tip:** Use `docker logs -f voicelive-gateway` to monitor gateway logs in real-time during testing.
+
+## Call Recording
+
+The gateway supports optional per-call conversation recording that captures both the caller and the AI assistant into a single WAV file. Recording is disabled by default and controlled entirely via environment variables.
+
+### Enabling Recording
+
+Set `RECORDING_ENABLED=true` in your `.env` file (or pass it as an environment variable). Recordings are written to the `RECORDING_DIR` directory (default: `recordings/`) with filenames following the pattern:
+
+```
+call_{caller_number}_{YYYYMMDD_HHmmss}.wav
+```
+
+For example: `call_+15551234567_20260216_143022.wav`
+
+### Technical Implementation
+
+Recording is implemented in the `recording/` module via the `CallRecorder` class and integrates into the existing audio pipeline with zero impact on call quality.
+
+#### Architecture
+
+```
+┌─────────────┐       ┌──────────────────────┐       ┌─────────────────┐
+│  SIP Caller  │──RTP──▶  pjsua Conference    │──────▶│  VoiceLive API  │
+│  (8 kHz)     │◀──RTP──  Bridge (PCM16 8kHz) │◀──────│  (24 kHz)       │
+└─────────────┘       └──────────┬───────────┘       └─────────────────┘
+                                 │
+                        ┌────────▼────────┐
+                        │  CallRecorder   │
+                        │  (taps both     │
+                        │   directions)   │
+                        └────────┬────────┘
+                                 │ finalize()
+                        ┌────────▼────────┐
+                        │  WAV File       │
+                        │  mono 8kHz PCM16│
+                        └─────────────────┘
+```
+
+#### Audio Capture Points
+
+The recorder taps audio at two points inside `AudioStreamBridge`, both at the native 8 kHz PCM16 level — no extra resampling is performed for recording:
+
+1. **Caller audio** — captured in `enqueue_sip_audio()` when raw PCM16 8 kHz frames arrive from pjsua (before upsampling to 24 kHz for VoiceLive). Each frame is 320 bytes (20 ms at 8 kHz, 16-bit mono).
+
+2. **AI audio** — captured in `dequeue_sip_audio_sync()` when frames are delivered to pjsua for RTP transmission (after downsampling from 24 kHz). This includes both real audio frames and silence frames. By tapping at the dequeue point rather than the ingest point, the recorder captures **only audio that was actually played to the caller** — AI speech discarded during barge-in interruptions is excluded.
+
+#### Timing Synchronization
+
+Both buffers stay perfectly time-aligned because:
+- The caller buffer receives one 20 ms frame per `enqueue_sip_audio()` call from the pjsua media thread.
+- The AI buffer receives one 20 ms frame per `dequeue_sip_audio_sync()` call — including silence frames when no AI audio is queued. Since pjsua calls this method on a strict 20 ms cadence, both buffers grow at exactly the same real-time rate.
+
+#### Mixing & Output
+
+At call teardown, `CallRecorder.finalize()` runs in a thread-pool executor (off the event loop) and:
+1. Converts both `bytearray` buffers to `numpy` int16 arrays.
+2. Zero-pads the shorter array to match the longer one.
+3. Sums both arrays with `int32` arithmetic and clips to `[-32768, 32767]` to prevent overflow.
+4. Writes the result as a standard WAV file (mono, 8 kHz, 16-bit PCM) using Python's built-in `wave` module — no external audio dependencies required.
+
+#### Thread Safety
+
+No locks are needed. Each buffer has a single writer:
+- `_caller_buf` is written exclusively from the asyncio event-loop thread (via `enqueue_sip_audio`).
+- `_ai_buf` is written exclusively from the pjsua media thread (via `dequeue_sip_audio_sync`).
+- `finalize()` runs only after both writers have stopped (post-call cleanup), so there is no concurrent access.
+
+#### Production Safety
+
+| Guard | Behavior |
+|---|---|
+| **Duration cap** | Recording stops accepting frames after `RECORDING_MAX_DURATION_SEC` (default 30 min). The call itself continues unaffected. Peak memory per call: ~57 MB (two 28.8 MB buffers). |
+| **Disk-space check** | Before writing, `shutil.disk_usage()` verifies at least `RECORDING_MIN_DISK_MB` free space. If insufficient, the recording is skipped with an error log — the call is never interrupted. |
+| **Graceful failure** | Any exception during `finalize()` is caught and logged. Recording failures never propagate to the SIP call or VoiceLive session. |
+| **Memory release** | Buffers are explicitly cleared after WAV write (or on skip) to promptly free memory for the next call. |
+
+#### Docker Volumes
+
+When running in Docker, recordings are persisted to the host via a volume mount configured in `docker-compose.yml`:
+
+```yaml
+volumes:
+  - ./recordings:/app/recordings
+```
+
+This ensures recordings survive container restarts. The `Dockerfile` creates the `/app/recordings` directory during build.
