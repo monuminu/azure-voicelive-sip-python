@@ -11,5 +11,7 @@ services:
       - 0.0.0.0:10000-11000:10000-11000/udp  # RTP media ports
     env_file:
       - .env
+    volumes:
+      - ./recordings:/app/recordings
     container_name: voicelive-sip-gateway
     restart: unless-stopped

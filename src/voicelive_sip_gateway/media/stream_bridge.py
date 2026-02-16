@@ -14,6 +14,9 @@ import structlog
 from voicelive_sip_gateway.config.settings import Settings
 from voicelive_sip_gateway.media.transcode import resample_pcm16
 
+if __import__('typing').TYPE_CHECKING:
+    from voicelive_sip_gateway.recording.recorder import CallRecorder
+
 
 class AudioStreamBridge:
     """Bidirectional audio pump between SIP (μ-law) and Voice Live (PCM16 24kHz)."""
@@ -21,7 +24,7 @@ class AudioStreamBridge:
     VOICELIVE_SAMPLE_RATE = 24000
     SIP_SAMPLE_RATE = 8000
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, recorder: Optional["CallRecorder"] = None) -> None:
         self._settings = settings
         self._logger: BoundLogger = structlog.get_logger(__name__)
         self._inbound_queue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -29,6 +32,8 @@ class AudioStreamBridge:
         self._outbound_queue: queue.Queue[bytes] = queue.Queue()
         self._task: Optional[asyncio.Task[None]] = None
         self._voicelive_client = None
+        # Optional per-call recorder (taps both directions at 8 kHz)
+        self._recorder = recorder
         # Thread pool for CPU-bound resampling to avoid blocking event loop
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="resample")
         # Logging counters
@@ -71,6 +76,10 @@ class AudioStreamBridge:
         
         await self._inbound_queue.put(pcm_payload)
 
+        # Tap caller audio for recording (already 8 kHz PCM16)
+        if self._recorder:
+            self._recorder.append_caller_frame(pcm_payload)
+
     def dequeue_sip_audio_sync(self) -> bytes:
         """Get PCM16 audio for SIP - SYNCHRONOUS, safe to call from pjsua thread.
         
@@ -82,6 +91,10 @@ class AudioStreamBridge:
         try:
             # Non-blocking get from thread-safe queue - NO asyncio overhead
             frame = self._outbound_queue.get_nowait()
+            
+            # Tap AI audio for recording (8 kHz PCM16 — only what the caller hears)
+            if self._recorder:
+                self._recorder.append_ai_frame(frame)
             
             # Log every second with audio stats
             now = time.time()
@@ -107,7 +120,11 @@ class AudioStreamBridge:
                 )
                 self._last_outbound_log_time = now
             # Return 20ms of silence (160 samples at 8kHz = 320 bytes)
-            return b'\x00' * 320
+            silence = b'\x00' * 320
+            # Record silence too so AI buffer stays time-aligned with caller buffer
+            if self._recorder:
+                self._recorder.append_ai_frame(silence)
+            return silence
 
     async def feed_voicelive_audio(self, pcm_chunk: bytes) -> None:
         if not self._voicelive_client:
